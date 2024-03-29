@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Thread
 
 import numpy as np
+import torch_musa
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,21 +28,23 @@ from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
-    fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
-    check_requirements, print_mutation, set_logging, one_cycle, colorstr
+    fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_img_size, \
+    print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
 from utils.loss import ComputeLoss, ComputeLossOTA
-from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
+from utils.plots import plot_images, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
+RANK = int(os.getenv("RANK", -1))
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
-    save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
-        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
+    save_dir, epochs, batch_size, total_batch_size, weights, freeze = \
+        Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.freeze
 
     # Directories
     wdir = save_dir / 'weights'
@@ -58,15 +61,15 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Configure
     plots = not opt.evolve  # create plots
-    cuda = device.type != 'cpu'
-    init_seeds(2 + rank)
+    musa = device.type != 'cpu'
+    init_seeds(2 + RANK)
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
 
     # Logging- Doing this before checking the dataset. Might update data_dict
     loggers = {'wandb': None}  # loggers dict
-    if rank in [-1, 0]:
+    if RANK in [-1, 0]:
         opt.hyp = hyp  # add hyperparameters
         run_id = torch.load(weights, map_location=device).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
         wandb_logger = WandbLogger(opt, Path(opt.save_dir).stem, run_id, data_dict)
@@ -82,7 +85,7 @@ def train(hyp, opt, device, tb_writer=None):
     # Model
     pretrained = weights.endswith('.pt')
     if pretrained:
-        with torch_distributed_zero_first(rank):
+        with torch_distributed_zero_first(RANK):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
@@ -93,7 +96,7 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-    with torch_distributed_zero_first(rank):
+    with torch_distributed_zero_first(RANK):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
     test_path = data_dict['val']
@@ -121,60 +124,60 @@ def train(hyp, opt, device, tb_writer=None):
         elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
             pg1.append(v.weight)  # apply decay
         if hasattr(v, 'im'):
-            if hasattr(v.im, 'implicit'):           
+            if hasattr(v.im, 'implicit'):
                 pg0.append(v.im.implicit)
             else:
                 for iv in v.im:
                     pg0.append(iv.implicit)
         if hasattr(v, 'imc'):
-            if hasattr(v.imc, 'implicit'):           
+            if hasattr(v.imc, 'implicit'):
                 pg0.append(v.imc.implicit)
             else:
                 for iv in v.imc:
                     pg0.append(iv.implicit)
         if hasattr(v, 'imb'):
-            if hasattr(v.imb, 'implicit'):           
+            if hasattr(v.imb, 'implicit'):
                 pg0.append(v.imb.implicit)
             else:
                 for iv in v.imb:
                     pg0.append(iv.implicit)
         if hasattr(v, 'imo'):
-            if hasattr(v.imo, 'implicit'):           
+            if hasattr(v.imo, 'implicit'):
                 pg0.append(v.imo.implicit)
             else:
                 for iv in v.imo:
                     pg0.append(iv.implicit)
         if hasattr(v, 'ia'):
-            if hasattr(v.ia, 'implicit'):           
+            if hasattr(v.ia, 'implicit'):
                 pg0.append(v.ia.implicit)
             else:
                 for iv in v.ia:
                     pg0.append(iv.implicit)
         if hasattr(v, 'attn'):
-            if hasattr(v.attn, 'logit_scale'):   
+            if hasattr(v.attn, 'logit_scale'):
                 pg0.append(v.attn.logit_scale)
-            if hasattr(v.attn, 'q_bias'):   
+            if hasattr(v.attn, 'q_bias'):
                 pg0.append(v.attn.q_bias)
-            if hasattr(v.attn, 'v_bias'):  
+            if hasattr(v.attn, 'v_bias'):
                 pg0.append(v.attn.v_bias)
-            if hasattr(v.attn, 'relative_position_bias_table'):  
+            if hasattr(v.attn, 'relative_position_bias_table'):
                 pg0.append(v.attn.relative_position_bias_table)
         if hasattr(v, 'rbr_dense'):
-            if hasattr(v.rbr_dense, 'weight_rbr_origin'):  
+            if hasattr(v.rbr_dense, 'weight_rbr_origin'):
                 pg0.append(v.rbr_dense.weight_rbr_origin)
-            if hasattr(v.rbr_dense, 'weight_rbr_avg_conv'): 
+            if hasattr(v.rbr_dense, 'weight_rbr_avg_conv'):
                 pg0.append(v.rbr_dense.weight_rbr_avg_conv)
-            if hasattr(v.rbr_dense, 'weight_rbr_pfir_conv'):  
+            if hasattr(v.rbr_dense, 'weight_rbr_pfir_conv'):
                 pg0.append(v.rbr_dense.weight_rbr_pfir_conv)
-            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_idconv1'): 
+            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_idconv1'):
                 pg0.append(v.rbr_dense.weight_rbr_1x1_kxk_idconv1)
-            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_conv2'):   
+            if hasattr(v.rbr_dense, 'weight_rbr_1x1_kxk_conv2'):
                 pg0.append(v.rbr_dense.weight_rbr_1x1_kxk_conv2)
-            if hasattr(v.rbr_dense, 'weight_rbr_gconv_dw'):   
+            if hasattr(v.rbr_dense, 'weight_rbr_gconv_dw'):
                 pg0.append(v.rbr_dense.weight_rbr_gconv_dw)
-            if hasattr(v.rbr_dense, 'weight_rbr_gconv_pw'):   
+            if hasattr(v.rbr_dense, 'weight_rbr_gconv_pw'):
                 pg0.append(v.rbr_dense.weight_rbr_gconv_pw)
-            if hasattr(v.rbr_dense, 'vector'):   
+            if hasattr(v.rbr_dense, 'vector'):
                 pg0.append(v.rbr_dense.vector)
 
     if opt.adam:
@@ -197,7 +200,7 @@ def train(hyp, opt, device, tb_writer=None):
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
-    ema = ModelEMA(model) if rank in [-1, 0] else None
+    ema = ModelEMA(model) if RANK in [-1, 0] else None
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
@@ -233,17 +236,17 @@ def train(hyp, opt, device, tb_writer=None):
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
 
     # DP mode
-    if cuda and rank == -1 and torch.cuda.device_count() > 1:
+    if musa and RANK == -1 and torch.musa.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
     # SyncBatchNorm
-    if opt.sync_bn and cuda and rank != -1:
+    if opt.sync_bn and musa and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
 
     # Trainloader
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=RANK,
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
@@ -251,7 +254,7 @@ def train(hyp, opt, device, tb_writer=None):
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
     # Process 0
-    if rank in [-1, 0]:
+    if RANK in [-1, 0]:
         testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                        world_size=opt.world_size, workers=opt.workers,
@@ -273,8 +276,8 @@ def train(hyp, opt, device, tb_writer=None):
             model.half().float()  # pre-reduce anchor precision
 
     # DDP mode
-    if cuda and rank != -1:
-        model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
+    if musa and RANK != -1:
+        model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK,
                     # nn.MultiheadAttention incompatibility with DDP https://github.com/pytorch/pytorch/issues/26698
                     find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
 
@@ -296,7 +299,7 @@ def train(hyp, opt, device, tb_writer=None):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(enabled=cuda)
+    scaler = amp.GradScaler(enabled=musa)
     compute_loss_ota = ComputeLossOTA(model)  # init loss class
     compute_loss = ComputeLoss(model)  # init loss class
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
@@ -310,15 +313,15 @@ def train(hyp, opt, device, tb_writer=None):
         # Update image weights (optional)
         if opt.image_weights:
             # Generate indices
-            if rank in [-1, 0]:
+            if RANK in [-1, 0]:
                 cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
                 iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
                 dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)  # rand weighted idx
             # Broadcast if DDP
-            if rank != -1:
-                indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
+            if RANK != -1:
+                indices = (torch.tensor(dataset.indices) if RANK == 0 else torch.zeros(dataset.n)).int()
                 dist.broadcast(indices, 0)
-                if rank != 0:
+                if RANK != 0:
                     dataset.indices = indices.cpu().numpy()
 
         # Update mosaic border
@@ -326,11 +329,11 @@ def train(hyp, opt, device, tb_writer=None):
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
         mloss = torch.zeros(4, device=device)  # mean losses
-        if rank != -1:
+        if RANK != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
-        if rank in [-1, 0]:
+        if RANK in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
@@ -357,13 +360,13 @@ def train(hyp, opt, device, tb_writer=None):
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            with amp.autocast(enabled=cuda):
+            with amp.autocast(enabled=musa):
                 pred = model(imgs)  # forward
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
                     loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
                 else:
                     loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if rank != -1:
+                if RANK != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.
@@ -380,9 +383,9 @@ def train(hyp, opt, device, tb_writer=None):
                     ema.update(model)
 
             # Print
-            if rank in [-1, 0]:
+            if RANK in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-                mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+                mem = '%.3gG' % (torch.musa.memory_reserved() / 1E9 if torch.musa.is_available() else 0)  # (GB)
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
                 pbar.set_description(s)
@@ -406,7 +409,7 @@ def train(hyp, opt, device, tb_writer=None):
         scheduler.step()
 
         # DDP process 0 or single-GPU
-        if rank in [-1, 0]:
+        if RANK in [-1, 0]:
             # mAP
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
@@ -480,7 +483,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
-    if rank in [-1, 0]:
+    if RANK in [-1, 0]:
         # Plots
         if plots:
             plot_results(save_dir=save_dir)  # save as results.png
@@ -520,18 +523,18 @@ def train(hyp, opt, device, tb_writer=None):
         wandb_logger.finish_run()
     else:
         dist.destroy_process_group()
-    torch.cuda.empty_cache()
+    torch.musa.empty_cache()
     return results
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='yolo7.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path')
+    parser.add_argument('--cfg', type=str, default='cfg/training/yolov7.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
+    parser.add_argument('--batch-size', type=int, default=128, help='total batch size for all GPUs')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
@@ -542,16 +545,16 @@ if __name__ == '__main__':
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--device', default='', help='musa device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
     parser.add_argument('--adam', action='store_true', help='use torch.optim.Adam() optimizer')
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+    parser.add_argument('--local-rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
     parser.add_argument('--project', default='runs/train', help='save to project/name')
     parser.add_argument('--entity', default=None, help='W&B entity')
-    parser.add_argument('--name', default='exp', help='save to project/name')
+    parser.add_argument('--name', default='yolov7', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
@@ -565,22 +568,26 @@ if __name__ == '__main__':
     opt = parser.parse_args()
 
     # Set DDP variables
-    opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
+    if isinstance(opt.device, str) and len(opt.device):  # i.e. device='0' or device='0,1,2,3'
+        opt.world_size = len(opt.device.split(","))
+    elif isinstance(opt.device, (tuple, list)):  # i.e. device=[0,1,2,3]
+        opt.world_size = len(opt.device)
+    elif torch.musa.is_available():  # i.e. device=None or device=''
+        opt.world_size = 1
+    else:
+        opt.world_size = 0
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
-    #if opt.global_rank in [-1, 0]:
-    #    check_git_status()
-    #    check_requirements()
 
     # Resume
     wandb_run = check_wandb_resume(opt)
     if opt.resume and not wandb_run:  # resume an interrupted run
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
-        apriori = opt.global_rank, opt.local_rank
+        apriori = opt.global_rank, LOCAL_RANK
         with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
             opt = argparse.Namespace(**yaml.load(f, Loader=yaml.SafeLoader))  # replace
-        opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
+        opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, LOCAL_RANK = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
     else:
         # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
@@ -593,12 +600,13 @@ if __name__ == '__main__':
     # DDP mode
     opt.total_batch_size = opt.batch_size
     device = select_device(opt.device, batch_size=opt.batch_size)
-    if opt.local_rank != -1:
-        assert torch.cuda.device_count() > opt.local_rank
-        torch.cuda.set_device(opt.local_rank)
-        device = torch.device('cuda', opt.local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
-        assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
+    if LOCAL_RANK != -1:
+        # assert torch.musa.device_count() > LOCAL_RANK
+        torch.musa.set_device(RANK)
+        device = torch.device('musa', RANK)
+        os.environ["MCCL_BLOCKING_WAIT"] = "1"
+        dist.init_process_group(backend='mccl', rank=RANK, world_size=opt.world_size)  # distributed backend
+        assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of MUSA device count'
         opt.batch_size = opt.total_batch_size // opt.world_size
 
     # Hyperparameters
@@ -648,13 +656,13 @@ if __name__ == '__main__':
                 'mixup': (1, 0.0, 1.0),   # image mixup (probability)
                 'copy_paste': (1, 0.0, 1.0),  # segment copy-paste (probability)
                 'paste_in': (1, 0.0, 1.0)}    # segment copy-paste (probability)
-        
+
         with open(opt.hyp, errors='ignore') as f:
             hyp = yaml.safe_load(f)  # load hyps dict
             if 'anchors' not in hyp:  # anchors commented in hyp.yaml
                 hyp['anchors'] = 3
-                
-        assert opt.local_rank == -1, 'DDP mode not implemented for --evolve'
+
+        assert LOCAL_RANK == -1, 'DDP mode not implemented for --evolve'
         opt.notest, opt.nosave = True, True  # only test/save final epoch
         # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
         yaml_file = Path(opt.save_dir) / 'hyp_evolved.yaml'  # save best result here

@@ -65,25 +65,25 @@ def select_device(device='', batch_size=None):
     s = f'YOLOR 🚀 {git_describe() or date_modified()} torch {torch.__version__} '  # string
     cpu = device.lower() == 'cpu'
     if cpu:
-        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # force torch.cuda.is_available() = False
+        os.environ['MUSA_VISIBLE_DEVICES'] = '-1'  # force torch.cuda.is_available() = False
     elif device:  # non-cpu device requested
-        os.environ['CUDA_VISIBLE_DEVICES'] = device  # set environment variable
-        assert torch.cuda.is_available(), f'CUDA unavailable, invalid device {device} requested'  # check availability
+        os.environ['MUSA_VISIBLE_DEVICES'] = device  # set environment variable
+        assert torch.musa.is_available(), f'MUSA unavailable, invalid device {device} requested'  # check availability
 
-    cuda = not cpu and torch.cuda.is_available()
-    if cuda:
-        n = torch.cuda.device_count()
+    musa = not cpu and torch.musa.is_available()
+    if musa:
+        n = torch.musa.device_count()
         if n > 1 and batch_size:  # check that batch_size is compatible with device_count
             assert batch_size % n == 0, f'batch-size {batch_size} not multiple of GPU count {n}'
         space = ' ' * len(s)
         for i, d in enumerate(device.split(',') if device else range(n)):
-            p = torch.cuda.get_device_properties(i)
-            s += f"{'' if i == 0 else space}CUDA:{d} ({p.name}, {p.total_memory / 1024 ** 2}MB)\n"  # bytes to MB
+            p = torch.musa.get_device_properties(i)
+            s += f"{'' if i == 0 else space}MUSA:{d} ({p.name}, {p.total_memory / 1024 ** 2}MB)\n"  # bytes to MB
     else:
         s += 'CPU\n'
 
     logger.info(s.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else s)  # emoji-safe
-    return torch.device('cuda:0' if cuda else 'cpu')
+    return torch.device('musa:0' if musa else 'cpu')
 
 
 def time_synchronized():
@@ -342,10 +342,10 @@ def revert_sync_batchnorm(module):
 
 class TracedModel(nn.Module):
 
-    def __init__(self, model=None, device=None, img_size=(640,640)): 
+    def __init__(self, model=None, device=None, img_size=(640,640)):
         super(TracedModel, self).__init__()
-        
-        print(" Convert model to Traced-model... ") 
+
+        print(" Convert model to Traced-model... ")
         self.stride = model.stride
         self.names = model.names
         self.model = model
@@ -356,9 +356,9 @@ class TracedModel(nn.Module):
 
         self.detect_layer = self.model.model[-1]
         self.model.traced = True
-        
+
         rand_example = torch.rand(1, 3, img_size, img_size)
-        
+
         traced_script_module = torch.jit.trace(self.model, rand_example, strict=False)
         #traced_script_module = torch.jit.script(self.model)
         traced_script_module.save("traced_model.pt")
@@ -366,7 +366,7 @@ class TracedModel(nn.Module):
         self.model = traced_script_module
         self.model.to(device)
         self.detect_layer.to(device)
-        print(" model is traced! \n") 
+        print(" model is traced! \n")
 
     def forward(self, x, augment=False, profile=False):
         out = self.model(x)

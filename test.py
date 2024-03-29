@@ -6,6 +6,7 @@ from threading import Thread
 
 import numpy as np
 import torch
+import torch_musa
 import yaml
 from tqdm import tqdm
 
@@ -58,7 +59,7 @@ def test(data,
         model = attempt_load(weights, map_location=device)  # load FP32 model
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
-        
+
         if trace:
             model = TracedModel(model, device, imgsz)
 
@@ -92,7 +93,7 @@ def test(data,
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
-    
+
     seen = 0
     confusion_matrix = ConfusionMatrix(nc=nc)
     names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
@@ -176,7 +177,7 @@ def test(data,
                                   'score': round(p[4], 5)})
 
             # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+            correct = torch.zeros(pred.shape[0], niou, dtype=torch.long, device=device)
             if nl:
                 detected = []  # target indices
                 tcls_tensor = labels[:, 0]
@@ -204,7 +205,8 @@ def test(data,
                             if d.item() not in detected_set:
                                 detected_set.add(d.item())
                                 detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                mask = (ious[j] > iouv).long()
+                                correct[pi[j]] = mask  # iou_thres is 1xn
                                 if len(detected) == nl:  # all targets already located in image
                                     break
 

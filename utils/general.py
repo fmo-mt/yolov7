@@ -229,6 +229,7 @@ def labels_to_class_weights(labels, nc=80):
     weights[weights == 0] = 1  # replace empty bins with 1
     weights = 1 / weights  # number of targets per class
     weights /= weights.sum()  # normalize
+    weights = weights.astype(np.float32)
     return torch.from_numpy(weights)
 
 
@@ -493,7 +494,7 @@ def box_giou(box1, box2):
 
     area1 = box_area(box1.T)
     area2 = box_area(box2.T)
-    
+
     inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
     union = (area1[:, None] + area2 - inter)
 
@@ -528,7 +529,7 @@ def box_ciou(box1, box2, eps: float = 1e-7):
 
     area1 = box_area(box1.T)
     area2 = box_area(box2.T)
-    
+
     inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
     union = (area1[:, None] + area2 - inter)
 
@@ -580,7 +581,7 @@ def box_diou(box1, box2, eps: float = 1e-7):
 
     area1 = box_area(box1.T)
     area2 = box_area(box2.T)
-    
+
     inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
     union = (area1[:, None] + area2 - inter)
 
